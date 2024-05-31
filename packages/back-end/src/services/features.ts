@@ -16,13 +16,24 @@ import {
   PrerequisiteStateResult,
   validateCondition,
   validateFeatureValue,
+  getSavedGroupsValuesFromGroupMap,
+  getSavedGroupsValuesFromInterfaces,
 } from "shared/util";
 import {
+  NodeHandler,
+  recursiveWalk,
   scrubExperiments,
   scrubFeatures,
+  scrubSavedGroups,
   SDKCapability,
 } from "shared/sdk-versioning";
 import cloneDeep from "lodash/cloneDeep";
+import pickBy from "lodash/pickBy";
+import {
+  GroupMap,
+  SavedGroupsValues,
+  SavedGroupInterface,
+} from "shared/src/types";
 import {
   ApiReqContext,
   AutoExperimentWithProject,
@@ -47,7 +58,10 @@ import {
   getAllVisualExperiments,
 } from "../models/ExperimentModel";
 import { getFeatureDefinition, getParsedCondition } from "../util/features";
-import { getAllSavedGroups } from "../models/SavedGroupModel";
+import {
+  getAllSavedGroups,
+  getSavedGroupsById,
+} from "../models/SavedGroupModel";
 import {
   Environment,
   OrganizationInterface,
@@ -58,7 +72,6 @@ import {
 import { getSDKPayload, updateSDKPayload } from "../models/SdkPayloadModel";
 import { logger } from "../util/logger";
 import { promiseAllChunks } from "../util/promise";
-import { GroupMap } from "../../types/saved-group";
 import { SDKPayloadKey } from "../../types/sdk-payload";
 import { ApiFeature, ApiFeatureEnvironment } from "../../types/openapi";
 import { ExperimentInterface, ExperimentPhase } from "../../types/experiment";
@@ -143,6 +156,7 @@ export function generateAutoExperimentsPayload({
 }): AutoExperimentWithProject[] {
   prereqStateCache[environment] = prereqStateCache[environment] || {};
 
+  const savedGroups = getSavedGroupsValuesFromGroupMap(groupMap);
   const isValidSDKExperiment = (
     e: AutoExperimentWithProject | null
   ): e is AutoExperimentWithProject => !!e;
@@ -151,6 +165,7 @@ export function generateAutoExperimentsPayload({
     visualExperiments,
     features,
     environment,
+    savedGroups,
     prereqStateCache
   );
 
@@ -158,6 +173,7 @@ export function generateAutoExperimentsPayload({
     urlRedirectExperiments,
     features,
     environment,
+    savedGroups,
     prereqStateCache
   );
 
@@ -281,7 +297,8 @@ export function generateAutoExperimentsPayload({
 }
 
 export async function getSavedGroupMap(
-  organization: OrganizationInterface
+  organization: OrganizationInterface,
+  savedGroups?: SavedGroupInterface[]
 ): Promise<GroupMap> {
   const attributes = organization.settings?.attributeSchema;
 
@@ -291,7 +308,10 @@ export async function getSavedGroupMap(
   });
 
   // Get "SavedGroups" for an organization and build a map of the SavedGroup's Id to the actual array of IDs, respecting the type.
-  const allGroups = await getAllSavedGroups(organization.id);
+  const allGroups =
+    typeof savedGroups === "undefined"
+      ? await getAllSavedGroups(organization.id, { includeValues: true })
+      : savedGroups;
 
   function getGroupValues(
     values: string[],
@@ -321,6 +341,36 @@ export async function getSavedGroupMap(
   );
 
   return groupMap;
+}
+
+// Only produce the id lists which are used by at least one feature or experiment
+export function filterUsedSavedGroups(
+  savedGroups: SavedGroupsValues,
+  features: Record<string, FeatureDefinition>,
+  experimentsDefinitions: AutoExperimentWithProject[]
+) {
+  const usedGroupIds = new Set(["grp_341u57sslws4ggzr"]);
+  const addToUsedGroupIds: NodeHandler = (node) => {
+    if (node[0] === "$inGroup" || node[0] === "$notInGroup") {
+      usedGroupIds.add(node[1]);
+    }
+  };
+  Object.values(features).forEach((feature) => {
+    if (!feature.rules) {
+      return;
+    }
+    feature.rules.forEach((rule) => {
+      recursiveWalk(rule.condition, addToUsedGroupIds);
+      recursiveWalk(rule.parentConditions, addToUsedGroupIds);
+    });
+  });
+  experimentsDefinitions.forEach((experimentDefinition) => {
+    recursiveWalk(experimentDefinition.condition, addToUsedGroupIds);
+    recursiveWalk(experimentDefinition.parentConditions, addToUsedGroupIds);
+  });
+  return pickBy(savedGroups, (_values, savedGroupId) =>
+    usedGroupIds.has(savedGroupId)
+  );
 }
 
 export async function refreshSDKPayloadCache(
@@ -398,6 +448,14 @@ export async function refreshSDKPayloadCache(
       prereqStateCache,
     });
 
+    const savedGroupsInUse = Object.keys(
+      filterUsedSavedGroups(
+        getSavedGroupsValuesFromGroupMap(groupMap),
+        featureDefinitions,
+        experimentsDefinitions
+      )
+    );
+
     promises.push(async () => {
       logger.debug(`Updating SDK Payload for ${context.org.id} ${environment}`);
       await updateSDKPayload({
@@ -405,6 +463,7 @@ export async function refreshSDKPayloadCache(
         environment: environment,
         featureDefinitions,
         experimentsDefinitions,
+        savedGroupsInUse,
       });
     });
   }
@@ -435,6 +494,8 @@ export type FeatureDefinitionsResponseArgs = {
   secureAttributeSalt?: string;
   projects: string[];
   capabilities: SDKCapability[];
+  savedGroups: SavedGroupsValues;
+  savedGroupAttributeKeys?: Record<string, string>;
 };
 async function getFeatureDefinitionsResponse({
   features,
@@ -449,6 +510,8 @@ async function getFeatureDefinitionsResponse({
   secureAttributeSalt,
   projects,
   capabilities,
+  savedGroups,
+  savedGroupAttributeKeys,
 }: FeatureDefinitionsResponseArgs) {
   if (!includeDraftExperiments) {
     experiments = experiments?.filter((e) => e.status !== "draft") || [];
@@ -513,10 +576,20 @@ async function getFeatureDefinitionsResponse({
         secureAttributeSalt
       );
     }
+
+    if (savedGroupAttributeKeys) {
+      savedGroups = applySavedGroupHashing(
+        savedGroups,
+        attributes,
+        savedGroupAttributeKeys,
+        secureAttributeSalt
+      );
+    }
   }
 
-  features = scrubFeatures(features, capabilities);
-  experiments = scrubExperiments(experiments, capabilities);
+  features = scrubFeatures(features, capabilities, savedGroups);
+  experiments = scrubExperiments(experiments, capabilities, savedGroups);
+  const scrubbedSavedGroups = scrubSavedGroups(savedGroups, capabilities);
 
   const includeAutoExperiments =
     !!includeRedirectExperiments || !!includeVisualExperiments;
@@ -535,6 +608,7 @@ async function getFeatureDefinitionsResponse({
       features,
       ...(includeAutoExperiments && { experiments }),
       dateUpdated,
+      savedGroups: scrubbedSavedGroups,
     };
   }
 
@@ -546,12 +620,19 @@ async function getFeatureDefinitionsResponse({
     ? await encrypt(JSON.stringify(experiments || []), encryptionKey)
     : undefined;
 
+  const encryptedSavedGroups = await encrypt(
+    JSON.stringify(scrubbedSavedGroups),
+    encryptionKey
+  );
+
   return {
     features: {},
     ...(includeAutoExperiments && { experiments: [] }),
     dateUpdated,
     encryptedFeatures,
     ...(includeAutoExperiments && { encryptedExperiments }),
+    savedGroups: {},
+    encryptedSavedGroups: encryptedSavedGroups,
   };
 }
 
@@ -574,6 +655,8 @@ export type FeatureDefinitionSDKPayload = {
   dateUpdated: Date | null;
   encryptedFeatures?: string;
   encryptedExperiments?: string;
+  savedGroups?: SavedGroupsValues;
+  encryptedSavedGroups?: string;
 };
 
 export async function getFeatureDefinitions({
@@ -601,18 +684,34 @@ export async function getFeatureDefinitions({
           features: {},
           experiments: [],
           dateUpdated: cached.dateUpdated,
+          savedGroups: {},
         };
       }
       let attributes: SDKAttributeSchema | undefined = undefined;
       let secureAttributeSalt: string | undefined = undefined;
+      let savedGroupAttributeKeys:
+        | Record<string, string>
+        | undefined = undefined;
+      const { features, experiments, savedGroupsInUse } = cached.contents;
+      const usedSavedGroups = await getSavedGroupsById(
+        savedGroupsInUse,
+        context.org.id
+      );
+      const savedGroups = getSavedGroupsValuesFromInterfaces(usedSavedGroups);
       if (hashSecureAttributes) {
         const org = await getOrganizationById(context.org.id);
         if (org && orgHasPremiumFeature(org, "hash-secure-attributes")) {
           secureAttributeSalt = org.settings?.secureAttributeSalt;
           attributes = org.settings?.attributeSchema;
+          savedGroupAttributeKeys = Object.fromEntries(
+            usedSavedGroups.map((savedGroup) => [
+              savedGroup.id,
+              savedGroup.attributeKey || "",
+            ])
+          );
         }
       }
-      const { features, experiments } = cached.contents;
+
       return await getFeatureDefinitionsResponse({
         features,
         experiments: experiments || [],
@@ -626,6 +725,8 @@ export async function getFeatureDefinitions({
         secureAttributeSalt,
         projects: projects || [],
         capabilities,
+        savedGroups: savedGroups || {},
+        savedGroupAttributeKeys,
       });
     }
   } catch (e) {
@@ -635,12 +736,7 @@ export async function getFeatureDefinitions({
   const org = await getOrganizationById(context.org.id);
   let attributes: SDKAttributeSchema | undefined = undefined;
   let secureAttributeSalt: string | undefined = undefined;
-  if (hashSecureAttributes) {
-    if (org && orgHasPremiumFeature(org, "hash-secure-attributes")) {
-      secureAttributeSalt = org?.settings?.secureAttributeSalt;
-      attributes = org.settings?.attributeSchema;
-    }
-  }
+  let savedGroupAttributeKeys: Record<string, string> | undefined = undefined;
   if (!org) {
     return await getFeatureDefinitionsResponse({
       features: {},
@@ -655,12 +751,30 @@ export async function getFeatureDefinitions({
       secureAttributeSalt,
       projects: projects || [],
       capabilities,
+      savedGroups: {},
+      savedGroupAttributeKeys: {},
     });
+  }
+
+  const savedGroups = await getAllSavedGroups(org.id, { includeValues: true });
+
+  if (
+    hashSecureAttributes &&
+    orgHasPremiumFeature(org, "hash-secure-attributes")
+  ) {
+    secureAttributeSalt = org?.settings?.secureAttributeSalt;
+    attributes = org.settings?.attributeSchema;
+    savedGroupAttributeKeys = Object.fromEntries(
+      savedGroups.map((savedGroup) => [
+        savedGroup.id,
+        savedGroup.attributeKey || "",
+      ])
+    );
   }
 
   // Generate the feature definitions
   const features = await getAllFeatures(context);
-  const groupMap = await getSavedGroupMap(org);
+  const groupMap = await getSavedGroupMap(org, savedGroups);
   const experimentMap = await getAllPayloadExperiments(context);
 
   const prereqStateCache: Record<
@@ -695,12 +809,19 @@ export async function getFeatureDefinitions({
     prereqStateCache,
   });
 
+  const savedGroupsInUse = filterUsedSavedGroups(
+    getSavedGroupsValuesFromGroupMap(groupMap),
+    featureDefinitions,
+    experimentsDefinitions
+  );
+
   // Cache in Mongo
   await updateSDKPayload({
     organization: context.org.id,
     environment,
     featureDefinitions,
     experimentsDefinitions,
+    savedGroupsInUse: Object.keys(savedGroupsInUse),
   });
 
   if (projects === null) {
@@ -709,6 +830,7 @@ export async function getFeatureDefinitions({
       features: {},
       experiments: [],
       dateUpdated: new Date(),
+      savedGroups: {},
     };
   }
 
@@ -725,6 +847,8 @@ export async function getFeatureDefinitions({
     secureAttributeSalt,
     projects: projects || [],
     capabilities,
+    savedGroups: savedGroupsInUse,
+    savedGroupAttributeKeys,
   });
 }
 
@@ -748,6 +872,7 @@ export function evaluateFeature({
   skipRulesWithPrerequisites?: boolean;
 }) {
   const results: FeatureTestResult[] = [];
+  const savedGroups = getSavedGroupsValuesFromGroupMap(groupMap);
 
   // change the NODE ENV so that we can get the debug log information:
   let switchEnv = false;
@@ -811,6 +936,7 @@ export function evaluateFeature({
           features: {
             [feature.id]: definition,
           },
+          savedGroups: savedGroups,
           attributes: attributes,
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           log: (msg: string, ctx: any) => {
@@ -1084,6 +1210,34 @@ export function applyExperimentHashing(
   });
 }
 
+// Specific hashing entrypoint for idList values
+export function applySavedGroupHashing(
+  savedGroups: SavedGroupsValues,
+  attributes: SDKAttributeSchema,
+  savedGroupAttributeKeys: Record<string, string>,
+  salt: string
+): SavedGroupsValues {
+  return Object.fromEntries(
+    Object.entries(savedGroups).map(([savedGroupId, savedGroupMembers]) => {
+      const attribute = attributes.find(
+        (attr) => attr.property === savedGroupAttributeKeys[savedGroupId]
+      );
+      return attribute
+        ? [
+            savedGroupId,
+            hashStrings({
+              obj: savedGroupMembers,
+              salt,
+              attributes,
+              attribute,
+              doHash: attribute.hashAttribute,
+            }),
+          ]
+        : [savedGroupId, savedGroupMembers];
+    })
+  );
+}
+
 interface hashStringsArgs {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   obj: any;
@@ -1131,7 +1285,8 @@ any {
             attribute?.datatype &&
             ["secureString", "secureString[]"].includes(
               attribute?.datatype ?? ""
-            )
+            ) &&
+            !["$inGroup", "$notInGroup"].includes(key)
           )
         : doHash;
 
@@ -1385,6 +1540,7 @@ export const reduceExperimentsWithPrerequisites = <
   experiments: T[],
   features: FeatureInterface[],
   environment: string,
+  savedGroups: SavedGroupsValues,
   prereqStateCache: Record<string, Record<string, PrerequisiteStateResult>> = {}
 ): T[] => {
   prereqStateCache[environment] = prereqStateCache[environment] || {};
